@@ -1,11 +1,11 @@
-import { type DocumentNode, type ObjectNode, print } from '@humanwhocodes/momoa';
+import { type DocumentNode, type ObjectNode, print, type StringNode } from '@humanwhocodes/momoa';
 import { type Token, type TokenNormalized, pluralize, splitID } from '@terrazzo/token-tools';
 import type ytm from 'yaml-to-momoa';
 import lintRunner from '../lint/index.js';
 import Logger from '../logger.js';
 import type { ConfigInit, InputSource } from '../types.js';
 import applyAliases from './alias.js';
-import { getObjMembers, toMomoa, tracePointer, traverse } from './json.js';
+import { getObjMembers, pointerToTokenID, toMomoa, tracePointer, traverse } from './json.js';
 import normalize from './normalize.js';
 import validateTokenNode from './validate.js';
 
@@ -17,6 +17,8 @@ export * from './validate.js';
 export { normalize, validateTokenNode };
 
 const INVALID_POINTERS = new Set(['', '#', '/', '#/']); // we can’t support these pointers which will recursively embed themselves
+// these are reserved keys on token nodes that may or may not exist, but get special behavior on token nodes specifically
+const TOKEN_RESERVED_KEYS = new Set(['$value', '$type', '$description', '$extensions', '$deprecated']);
 
 export interface ParseOptions {
   logger?: Logger;
@@ -108,7 +110,7 @@ export default async function parse(
 
   const totalStart = performance.now();
 
-  // 5. Resolve aliases and populate groups
+  // 5. Resolve {…} aliases and populate groups
   const aliasesStart = performance.now();
   let aliasCount = 0;
   for (const [id, token] of Object.entries(tokensSet)) {
@@ -192,59 +194,108 @@ async function parseSingle(
   });
   const tokensSet: Record<string, TokenNormalized> = {};
 
-  // 2. Walk AST once to resolve $refs (if any)
+  // 2. Resolve JSON Pointer aliases ($refs)
+  //    Note: this can happen first because they are capable of pointing to
+  //    other files, while {…} aliases can’t and can only be resolved after all
+  //    files have been loaded & parsed.
   const startResolve = performance.now();
   logger.debug({ group: 'parser', label: 'resolve', message: 'Start tokens resolving' });
-  const unresolvedPromises: Promise<any>[] = [];
+  const openResolvers: Promise<any>[] = [];
+  const baseMessage = { group: 'parser' as const, label: 'alias', filename, src };
   traverse(document, {
     enter(node) {
       // handle $refs and $defs
-      if (node.type === 'Member' && node.value.type === 'Object') {
-        const $refI = node.value.members.findIndex((m) => m.name.type === 'String' && m.name.value === '$ref');
-        let $ref = node.value.members[$refI];
-        if ($ref) {
-          if ($ref.value.type !== 'String') {
-            logger.error({
-              group: 'parser',
-              label: 'alias',
-              message: `Invalid ref: ${print($ref)}. Must be a valid JSON pointer (RFC 6901).`,
-              filename,
-              node,
-              src,
-            });
-            return;
-          }
-          const pointerValue = $ref.value.value;
-          if (INVALID_POINTERS.has(pointerValue)) {
-            logger.error({
-              group: 'parser',
-              label: 'alias',
-              message: `Invalid ref: ${pointerValue}. Can’t recursively embed the same document within itself.`,
-              filename,
-              node: $ref,
-              src,
-            });
-            return;
-          }
-          // note: by pushing these to the background, we can parallelize as many as possible at once
-          unresolvedPromises.push(
-            tracePointer(pointerValue, { filename, src, node: $ref, document, logger, yamlToMomoa, _sources }).then(
-              (result) => {
-                if (result) {
-                  // if pointer has been resolved, replace the $ref node outright with the resolved one
-                  // note that we’re ONLY replacing the $ref itself, NOT the parent object, so this is a
-                  // safe operation
-                  $ref = result.node as any;
-                }
-              },
-            ),
-          );
-        }
+      if (node.type !== 'Member' || node.value.type !== 'Object') {
+        return; // don’t skipTree()
       }
+      const rootName = (node.name as StringNode).value;
+      const { members: nodeMembers } = node.value;
+      const $refI = nodeMembers.findIndex((m) => (m.name as StringNode).value === '$ref');
+      if ($refI === -1) {
+        return;
+      }
+      const $ref = nodeMembers[$refI]!;
+      if ($ref.value.type !== 'String') {
+        logger.error({
+          ...baseMessage,
+          message: `Invalid ref: ${print($ref)}. Must be a valid JSON pointer (RFC 6901).`,
+          node,
+        });
+        return;
+      }
+      const pointerValue = $ref.value.value;
+      if (INVALID_POINTERS.has(pointerValue)) {
+        logger.error({
+          ...baseMessage,
+          message: `Invalid $ref: ${pointerValue}. Can’t recursively embed the same document within itself.`,
+          node: $ref,
+        });
+        return;
+      }
+      // note: by pushing these to the background, we can parallelize as many as possible at once
+      openResolvers.push(
+        tracePointer(pointerValue, { filename, src, node: $ref, document, logger, yamlToMomoa, _sources }).then(
+          (result) => {
+            if (!result) {
+              return;
+            }
+
+            // resrved keys
+            if (TOKEN_RESERVED_KEYS.has(rootName)) {
+              // shorthand: if the $ref is an object that matches the rootName, hoist that up
+              // this ONLY happens for reserved keys, and in no other instances
+              const aliasNode =
+                (result.node.type === 'Object' &&
+                  result.node.members.find((m) => (m.name as StringNode).value === rootName)) ||
+                result.node;
+              node.value = { ...aliasNode } as any;
+              if (rootName === '$value') {
+                (node as any)._aliasOf = pointerToTokenID(pointerValue);
+                (node as any)._aliasChain = result.pointerChain.map(pointerToTokenID);
+              }
+            }
+
+            // handle object alias
+            if (nodeMembers.length > 1 || result.node.type === 'Object') {
+              // throw error if trying to merge a non-object
+              if (result.node.type !== 'Object') {
+                logger.error({
+                  ...baseMessage,
+                  message: `Invalid $ref: can’t spread type ${result.node.type} into object node. $ref must be the only key and will replace the entire node.`,
+                  node: node.value,
+                });
+                return;
+              }
+
+              // remove $ref
+              const keys = nodeMembers.map((m) => (m.name as StringNode).value);
+              (node.value as ObjectNode).members = [...nodeMembers.slice(0, $refI), ...nodeMembers.slice($refI + 1)];
+
+              // add new members, but skip local conflicts (those are overrides)
+              for (const aliasMember of result.node.members) {
+                const isNewMember = !keys.includes((aliasMember.name as StringNode).value);
+                if (isNewMember) {
+                  const newMember = { ...aliasMember };
+                  if ((aliasMember.name as StringNode).value === '$value') {
+                    (newMember as any)._aliasOf = pointerToTokenID(pointerValue);
+                    (newMember as any)._aliasChain = result.pointerChain.map(pointerToTokenID);
+                  }
+                  nodeMembers.push(newMember);
+                }
+              }
+              return;
+            }
+
+            // handle arrays and primitives
+            // @ts-expect-error this is safe
+            node.value = { ...result.node };
+          },
+        ),
+      );
     },
   });
-  if (unresolvedPromises.length) {
-    await Promise.all(unresolvedPromises);
+  if (openResolvers.length) {
+    await Promise.all(openResolvers);
   }
   logger.debug({
     message: 'Finish tokens resolving',
@@ -259,7 +310,7 @@ async function parseSingle(
   const startValidate = performance.now();
   const $typeInheritance: Record<string, Token['$type']> = {};
   traverse(document, {
-    enter(node, parent, subpath) {
+    enter(node, parent, subpath, skipTree) {
       // if $type appears at root of tokens.json, collect it
       if (node.type === 'Document' && node.body.type === 'Object' && node.body.members) {
         const members = getObjMembers(node.body);
@@ -271,10 +322,41 @@ async function parseSingle(
 
       // handle tokens
       if (node.type === 'Member') {
-        const token = validateTokenNode(node, { filename, src, config, logger, parent, subpath, $typeInheritance });
-        if (token) {
-          tokensSet[token.id] = token;
-          tokenCount++;
+        if (node.value.type !== 'Object') {
+          skipTree();
+          return;
+        }
+
+        const memberName = node.name.type === 'String' && node.name.value;
+
+        // don’t evaluate $value | $extensions | $defs
+        const isUnvalidatable = memberName === '$value' || memberName === '$extensions' || memberName === '$defs';
+        if (isUnvalidatable) {
+          skipTree();
+          return;
+        }
+
+        const members = getObjMembers(node.value);
+        const isTokenNode = !!members.$value;
+        if (isTokenNode) {
+          const token = validateTokenNode(node, { filename, src, config, logger, parent, subpath, $typeInheritance });
+          if (token) {
+            tokensSet[token.id] = token;
+
+            const $valueMember = node.value.members.find((m) => (m.name as StringNode).value === '$value');
+            if (($valueMember as any)?._aliasOf) {
+              tokensSet[token.id]!.aliasOf = ($valueMember as any)._aliasOf;
+            }
+            if (($valueMember as any)?._aliasChain) {
+              tokensSet[token.id]!.aliasChain = ($valueMember as any)._aliasChain;
+            }
+            tokenCount++;
+          }
+        }
+        // preserve $type inheritance from groups down to token nodes (only for non-tokens)
+        else if ($typeInheritance && members.$type && members.$type.type === 'String') {
+          // @ts-ignore
+          $typeInheritance[subpath.join('.') || '.'] = node.value.members.find((m) => m.name.value === '$type');
         }
       }
     },

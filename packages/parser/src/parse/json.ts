@@ -15,7 +15,13 @@ import type { InputSource } from '../types.js';
 import { resolveRaw } from './resolve.js';
 
 export interface Visitor {
-  enter?: (node: AnyNode, parent: AnyNode | undefined, path: string[]) => void;
+  enter?: (
+    node: AnyNode,
+    parent: AnyNode | undefined,
+    path: string[],
+    /** callback to stop traversing this particular branch deeper and move to next sibling */
+    skipBranch: () => void,
+  ) => void;
   exit?: (node: AnyNode, parent: AnyNode | undefined, path: string[]) => void;
 }
 
@@ -87,24 +93,29 @@ export function traverse(root: AnyNode, visitor: Visitor) {
       nextPath.push('value' in name ? name.value : String(name));
     }
 
-    visitor.enter?.(node, parent, nextPath);
+    let isSkipped = false;
+    visitor.enter?.(node, parent, nextPath, () => {
+      isSkipped = true;
+    });
 
-    const childNode = CHILD_KEYS[node.type];
-    for (const key of childNode ?? []) {
-      const value = node[key as keyof typeof node];
+    if (!isSkipped) {
+      const childNode = CHILD_KEYS[node.type];
+      for (const key of childNode ?? []) {
+        const value = node[key as keyof typeof node];
 
-      if (value && typeof value === 'object') {
-        if (Array.isArray(value)) {
-          for (let i = 0; i < value.length; i++) {
-            visitNode(
-              // @ts-expect-error this is safe
-              value[i],
-              node,
-              key === 'elements' ? [...nextPath, String(i)] : nextPath,
-            );
+        if (value && typeof value === 'object') {
+          if (Array.isArray(value)) {
+            for (let i = 0; i < value.length; i++) {
+              visitNode(
+                // @ts-expect-error this is safe
+                value[i],
+                node,
+                key === 'elements' ? [...nextPath, String(i)] : nextPath,
+              );
+            }
+          } else if (isNode(value)) {
+            visitNode(value as unknown as AnyNode, node, nextPath);
           }
-        } else if (isNode(value)) {
-          visitNode(value as unknown as AnyNode, node, nextPath);
         }
       }
     }
@@ -229,7 +240,7 @@ export interface TracePointerOptions {
 export async function tracePointer(
   pointerValue: string,
   options: TracePointerOptions,
-): Promise<(InputSource & { node: AnyNode }) | undefined> {
+): Promise<(InputSource & { node: AnyNode; pointerChain: string[] }) | undefined> {
   if (!options._sources) {
     options._sources = {};
   }
@@ -237,6 +248,7 @@ export async function tracePointer(
     options._pointerChain = new Set();
   }
   const { filename, logger, node, src, document, yamlToMomoa } = options;
+  const baseMessage = { group: 'parser' as const, label: 'parse', filename, node, src };
   const { url: relativeURL, subpath } = parseJSONPointer(pointerValue);
   const refFilename = new URL(relativeURL, filename);
 
@@ -244,7 +256,7 @@ export async function tracePointer(
   const refID = `${refFilename.href}#${(subpath ?? []).join('/')}`;
   if (options._pointerChain.has(refID)) {
     const chain = [...options._pointerChain].join(' → ');
-    logger.error({ message: `Circular ref detected: ${chain}` });
+    logger.error({ ...baseMessage, message: `Circular ref detected: ${chain}` });
   }
   options._pointerChain.add(refID);
 
@@ -257,10 +269,8 @@ export async function tracePointer(
       resolvedNode = findNode(document, subpath);
     } else {
       logger.error({
+        ...baseMessage,
         message: `Invalid ref: ${pointerValue}. Can’t recursively embed the same document within itself.`,
-        filename,
-        node,
-        src,
       });
     }
   }
@@ -288,8 +298,16 @@ export async function tracePointer(
         return await tracePointer(nextPointerValue, options);
       }
     }
-    return { ...resolvedSource, node: resolvedNode };
+    return { ...resolvedSource, node: resolvedNode, pointerChain: [...options._pointerChain] };
   } else {
-    logger.error({ message: `Invalid ref: ${pointerValue} not found`, filename, node, src });
+    logger.error({
+      ...baseMessage,
+      message: `Invalid ref: ${pointerValue} not found`,
+    });
   }
+}
+
+/** Convert JSON pointer to Token ID */
+export function pointerToTokenID(pointer: string): string {
+  return (parseJSONPointer(pointer).subpath ?? []).join('.');
 }

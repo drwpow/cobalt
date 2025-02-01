@@ -758,24 +758,11 @@ export default function validateTokenNode(
   { config, filename, logger, parent, src, subpath, $typeInheritance }: ValidateTokenNodeOptions,
 ): TokenNormalized | undefined {
   // const start = performance.now();
-
-  // don’t validate $value
-  if (subpath.includes('$value') || node.value.type !== 'Object') {
+  if (node.value.type !== 'Object') {
     return;
   }
 
   const members = getObjMembers(node.value);
-
-  // keep track of $types
-  if ($typeInheritance && members.$type && members.$type.type === 'String' && !members.$value) {
-    // @ts-ignore
-    $typeInheritance[subpath.join('.') || '.'] = node.value.members.find((m) => m.name.value === '$type');
-  }
-
-  // don’t validate $extensions or $defs
-  if (!members.$value || subpath.includes('$extensions') || subpath.includes('$deps')) {
-    return;
-  }
 
   const id = subpath.join('.');
 
